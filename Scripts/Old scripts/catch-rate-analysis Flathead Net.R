@@ -1,0 +1,396 @@
+# Load the required libraries
+library(tidyverse)
+library(gratia)
+library(janitor)
+library(mgcv)
+library(DHARMa)
+library(visreg)
+
+# Load the data
+data <- read_csv("Data/Flathead Env data to model Flathead Net Commercial Daily.csv")
+
+# Standardize names of variables
+data <- data %>% clean_names()
+
+# Reduce df to just the variables needed
+data <- data %>%
+  dplyr::select(
+    estuary_name,
+    date = event_date,
+    fisher = authorised_fisher_id,
+    month,
+    cal_year,
+    catch = response,
+    effort = effort_qty, # metres of net
+    lunar_phase,
+    mean_daily_flow,
+    mean_wind) %>%
+  rename(estuary = estuary_name) %>%
+  mutate(C_E = catch/effort)
+    #recruit_flow,
+    #flow_mean_scaled,
+    #wind_speed_lag1
+   # ) %>% mutate(log_flow = log(mean_daily_flow+0.1)) #%>%
+    # group_by(estuary) %>% mutate(flow_mean_scaled = as.vector(scale(log_flow)),
+    #                            recruit_flow_scaled = as.vector(scale(logRecruitFlow)))
+
+summary(data$mean_daily_flow)
+#summary(data$log_flow)
+
+
+table(data$estuary, data$month)
+
+# # limit to months of overnight setting
+# data <- data %>% filter((estuary == "Lake Illawarra" & between(month, 6,8))|
+#                           (estuary == "Tuggerah Lakes" & between(month, 3,11))|
+#                           (estuary == "Wallis Lake" & between(month, 3,11)))
+# 
+# table(data$estuary, data$month)
+
+# Ensure date is in the correct format
+data <- data %>% mutate(date = ymd(date))
+
+# How often do they go fishing
+summary <- data %>%
+  group_by(fisher) %>%
+  summarise(days = length(unique(date)),
+            nets = n(),
+            effort = sum(effort),
+            catch = sum(catch))
+
+# Which fishers to remove? 
+# Never caught a flathead or fished less than 10 days
+remove <- summary %>%
+  filter(catch == 0 | days < 10) %>% 
+  pull(fisher)
+
+# Remove them
+data <- data %>% filter(!(fisher %in% remove))
+
+days <- summary %>% pull(days)
+catch <- summary %>% pull(catch)
+hist(days)
+
+mean(days)
+par(mfrow = c(2, 1))
+hist(days, breaks = max(days) / 10)
+abline(v = c(mean(days), median(days)), lty = c("dashed", "dotted"))
+boxplot(days, horizontal = TRUE)
+
+mean(catch)
+par(mfrow = c(2, 1))
+hist(catch, breaks = max(catch) / 10)
+abline(v = c(mean(catch), median(catch)), lty = c("dashed", "dotted"))
+boxplot(catch, horizontal = TRUE)
+
+# Have a look at the distribution of the variables
+dotchart(data$catch) # one dodgy - checked log sheet - remove
+data <- data %>% filter(catch < 500)
+#data <- data %>% filter(catch < 500)
+#dotchart(data$catch) # looks nicer now
+
+dotchart(data$effort) # mostly ok
+#data <- data %>% filter(effort < 4000) # even 2 km seems like heaps...
+#dotchart(data$effort)
+
+dotchart(data$catch / data$effort) # good - one possible high ~0.7
+data <- data %>% filter(C_E < 0.6)
+
+
+dotchart(data$lunar_phase) # all good - random/uniform
+dotchart(log(data$mean_daily_flow+0.01)) # not great raw - looks better logged
+dotchart(data$mean_wind) # all good - random/uniform
+
+#dotchart(data$wind_speed_lag1) # looks fine
+
+# Generate a net id
+data <- data %>% 
+  group_by(fisher, date) %>% 
+  mutate(net = paste0(fisher, "-", row_number())) %>% 
+  ungroup()
+
+# Check reporting - single row per data event
+n <- data %>% 
+  group_by(estuary, fisher, date) %>% 
+  summarise(n = n()) %>%
+  filter(n > 1) %>% 
+  nrow()
+
+print(n) 
+
+n / length(unique(data$date)) * 100 # 0.16% issues - fixed in next step 
+
+n <- data %>% 
+  group_by(estuary,fisher, date) %>% 
+  summarise(n = n()) %>%
+  filter(n > 1) %>% mutate(fisher_date_estuary = paste0(estuary, fisher, date, sep="_")) %>%
+  select(-fisher, -date, -estuary)
+
+data <- data %>% mutate(fisher_date_estuary = paste0(estuary, fisher, date, sep="_")) %>%
+  anti_join(n) %>% select(-fisher_date_estuary)
+
+
+# Calculate differences between observations
+data <- data %>%
+  group_by(estuary) %>% # for each estuary
+  arrange(date) %>% # order the data
+  mutate(t = as.numeric(date - lag(date, 1)), # the difference between dates
+         t = if_else(is.na(t), 1, t), # change from NA at t = 1
+         t = cumsum(t)) %>% # and now get the cumulative sum of the differences
+  ungroup()
+
+# Set up factors for REs
+data <- data %>% 
+  mutate(#estuary = factor(estuary),
+         fisher = factor(fisher),
+         estuary = as.factor(as.character(estuary)),
+         cal_year = factor(cal_year),
+         monthF = as.factor(as.character(month)),
+         log_flow = log(mean_daily_flow+0.05))
+
+# Try fitting with {mgcv} first
+m <- gam(
+  formula = catch ~ # kg?
+    monthF +  # month as factor
+    s(lunar_phase, bs = "cc") +
+    #s(month, bs = "cc", by = estuary) +
+    #s(wind_speed_lag1, bs = "tp", by = estuary) +
+    s(log_flow, bs = "tp", by = estuary) +
+    s(mean_wind, bs = "tp") +
+    # s(recruit_flow_scaled, bs = "tp", by = estuary) +
+    s(fisher, bs = "re") +
+    s(cal_year, bs = "re") +
+    offset(log(effort)), # metres of net
+  data = data,
+  family = tw(),  #tw(),
+  knots = list(lunar_phase = c(0, 2 * pi)), #month = c(1, 12), 
+  select = TRUE,
+  method = "REML"
+)
+
+appraise(m) 
+summary(m)
+
+
+appraise(mG) 
+summary(m)
+
+# Try fitting with {mgcv} first - no offset
+m2 <- gam(
+  formula = catch ~ # kg?
+    monthF +  # month as factor
+    s(lunar_phase, bs = "cc") +
+    #s(month, bs = "cc", by = estuary) +
+    #s(wind_speed_lag1, bs = "tp", by = estuary) +
+    s(log_flow, bs = "tp", by = estuary) +
+    s(mean_wind, bs = "tp") +
+    # s(recruit_flow_scaled, bs = "tp", by = estuary) +
+    s(fisher, bs = "re") +
+    s(cal_year, bs = "re"), # metres of net
+  data = data,
+  family = tw(),
+  knots = list(lunar_phase = c(0, 2 * pi)), #month = c(1, 12), 
+  select = TRUE,
+  method = "REML"
+)
+
+# Check out model residuals
+appraise(m2) 
+# Looks OK, heavy upper tail in QQ plot. I'm not really sure if these are the
+# right residuals to use to diagnose a Tweedie model - Hayden?
+
+# Simulate residuals with DHARMa
+simulationOutput <- simulateResiduals(m)
+residuals <- simulationOutput$scaledResiduals
+plot(simulationOutput)
+
+# Try DHARMa standard tests
+testResiduals(simulationOutput)
+# All tests are significant
+# QQ plot looks OK to me
+# Dispersion looks very bad
+# What to do about an overdispersed Tweedie model?
+
+# Heteroscedasticity
+testQuantiles(simulationOutput)
+# Qunatile regressions are significant, but the patterns don't look terrible...
+
+
+# Autocorrelation
+acf <- data.frame(
+  t = data$t,
+  #estuary = data$estuary,
+  fisher = data$fisher,
+  rqr = residuals,
+  deviance = resid(m, type = "deviance")
+)
+
+ggplot(data = acf, aes(x = t, y = rqr)) + 
+  geom_point(aes(colour = fisher), alpha = 0.3) +
+  geom_smooth(method = "gam") +
+  theme(legend.position = "none") +
+  scale_color_viridis_d() +
+  #facet_wrap(vars(estuary)) +
+  coord_cartesian(ylim = c(0, 1))
+
+# Some wiggliness but not sure it's meaningful?
+
+ggplot(data = acf, aes(x = t, y = deviance)) + 
+  geom_point(aes(colour = fisher), alpha = 0.3) +
+  geom_smooth(method = "gam") +
+  theme(legend.position = "none") +
+  scale_color_viridis_d() #+
+#  facet_wrap(vars(estuary))
+
+# Looks pretty good
+
+# CHeck out the model effects
+summary(m)
+
+# Look at the marginal effects
+draw(m, fun = inv_link(m))
+
+# Look at the conditional effects
+visreg(m, scale = "response", cond = list(effort = 100))
+
+# Estuary-specific conditional effects
+visreg(m, 
+       xvar = "log_flow", 
+       by = "estuary", 
+       cond = list(effort = 100),
+       scale = "response")
+
+
+
+xxx <- m$
+
+
+
+# How much variance in the REs?
+variance_components <- variance_comp(m)
+variance_components
+
+sum(variance_components$variance)
+
+#### Manual predictions to match telemetry plots
+new_data <- expand.grid("monthF" = unique(data$monthF),
+                        "log_flow" = median(data$log_flow, na.rm = T),
+                        #"estuary" = unique(data$estuary),
+                        "lunar_phase" = median(data$lunar_phase, na.rm = T),
+                        "mean_wind" = median(data$mean_wind, na.rm = T),
+                        "fisher" = data$fisher[1],
+                        "cal_year" = data$cal_year[1],
+                        "effort" = median(data$effort, na.rm=T))
+
+new_dat_preds <- predict(m, newdata = new_data, exclude = c("s(fisher)", "s(cal_year)") , se.fit = T,type = "response")
+
+new_data$fit <- new_dat_preds$fit
+new_data$se <- new_dat_preds$se.fit
+
+p4 <- ggplot(new_data, aes(monthF, fit)) + geom_point() +# facet_wrap(~Array) +
+  geom_errorbar(aes(ymin=fit-se, ymax = fit+se)) + theme_bw()
+p4
+
+# log_flow
+new_data2 <- expand.grid("monthF" = "6",
+                        "log_flow" = seq(min(data$log_flow, na.rm=T), max(data$log_flow, na.rm=T),0.1),
+                        #"Array" = unique(daily_move$Array),
+                        "lunar_phase" = median(data$lunar_phase, na.rm = T),
+                        "mean_wind" = median(data$mean_wind, na.rm = T),
+                        "fisher" = data$fisher[1],
+                        "cal_year" = data$cal_year[1],
+                        "effort" = median(data$effort, na.rm=T))
+
+new_dat_preds2 <- predict(m, newdata = new_data2, exclude = c("s(fisher)", "s(cal_year)") , se.fit = T,type = "response")
+
+new_data2$fit <- new_dat_preds2$fit
+new_data2$se <- new_dat_preds2$se.fit
+
+p1 <- ggplot(new_data2, aes((log_flow), fit)) + geom_line() +# facet_wrap(~Array) +
+  geom_ribbon(aes(ymin=fit-se, ymax = fit+se), alpha=0.1)
+p1
+
+# lunar
+# limits <- daily_move %>% group_by(Array) %>%
+#   summarise(min_flow = min(log_flow, na.rm=T),
+#             max_flow = max(log_flow, na.rm=T))
+
+new_data3 <- expand.grid("monthF" = "6",
+                         "log_flow" = median(data$log_flow),
+                         #"Array" = unique(daily_move$Array),
+                         "lunar_phase" = seq(min(data$lunar_phase), max(data$lunar_phase), 0.1),
+                         "mean_wind" = median(data$mean_wind, na.rm = T),
+                         "fisher" = data$fisher[1],
+                         "cal_year" = data$cal_year[1],
+                         "effort" = median(data$effort, na.rm=T))
+
+new_dat_preds3 <- predict(m, newdata = new_data3, exclude = c("s(fisher)", "s(cal_year)") , se.fit = T,type = "response")
+
+new_data3$fit <- new_dat_preds3$fit
+new_data3$se <- new_dat_preds3$se.fit
+
+p2 <- ggplot(new_data3, aes(lunar_phase, fit)) + geom_line() + # facet_wrap(~Array) +
+  geom_ribbon(aes(ymin=fit-se, ymax = fit+se), alpha=0.1)
+p2
+
+# wind_speed
+
+new_data4 <- expand.grid("Month" = median(daily_move$Month),
+                         "log_flow" = median(daily_move$log_flow, na.rm=T),
+                         "Array" = unique(daily_move$Array),
+                         "Speed_km_hr" = seq(min(daily_move$Speed_km_hr), max(daily_move$Speed_km_hr), 0.1),
+                         "lunar" = median(daily_move$lunar, na.rm = T),
+                         "ID" = daily_move$ID[1]) %>% left_join(limits2) %>%
+  filter(Speed_km_hr <= max_speed) %>% filter(Speed_km_hr >= min_speed)
+
+new_data4 <- expand.grid("monthF" = "6",
+                         "log_flow" = median(data$log_flow),
+                         #"Array" = unique(daily_move$Array),
+                         "lunar_phase" = median(data$lunar_phase),
+                         "mean_wind" = seq(min(data$mean_wind), max(data$mean_wind), 0.1),
+                         "fisher" = data$fisher[1],
+                         "cal_year" = data$cal_year[1],
+                         "effort" = median(data$effort, na.rm=T))
+
+new_dat_preds4 <- predict(m, newdata = new_data4, exclude = c("s(fisher)", "s(cal_year)") , se.fit = T,type = "response")
+
+new_data4$fit <- new_dat_preds4$fit
+new_data4$se <- new_dat_preds4$se.fit
+
+p3 <- ggplot(new_data4, aes(mean_wind, fit)) + geom_line() +# facet_wrap(~Array) +
+  geom_ribbon(aes(ymin=fit-se, ymax = fit+se), alpha=0.1)
+p3
+
+library(patchwork)
+p1/p3/p4/p2 & theme_bw()
+
+ggsave("Shoalhaven model outcomes.png", dpi=300, width = 21, height=28, units="cm")
+
+devtools::install_github('eco-stats/ecostats', ref='main')
+library(ecostats)
+
+plotenvelope(m2, sim.method = "refit")
+
+
+
+
+
+### which fishers have the crazy high values
+
+new_data <- expand.grid("monthF" = "6",
+                        "log_flow" = median(data$log_flow, na.rm = T),
+                        "estuary" = "Wallis Lake",
+                        "lunar_phase" = median(data$lunar_phase, na.rm = T),
+                        "mean_wind" = median(data$mean_wind, na.rm = T),
+                        "fisher" = unique(data$fisher),
+                        "cal_year" = data$cal_year[1],
+                        "effort" = median(data$effort, na.rm=T))
+
+new_dat_preds <- predict(m, newdata = new_data, exclude = c("s(cal_year)") , se.fit = T,type = "response")
+
+new_data$fit <- new_dat_preds$fit
+new_data$se <- new_dat_preds$se.fit
+
+p4 <- ggplot(new_data, aes(fisher, fit)) + geom_point() +# facet_wrap(~Array) +
+  geom_errorbar(aes(ymin=fit-se, ymax = fit+se)) + theme_bw()
+p4
